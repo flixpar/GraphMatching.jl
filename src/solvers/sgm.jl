@@ -1,6 +1,4 @@
 using LinearAlgebra
-using LinearAlgebra: BLAS.gemm
-using SparseArrays: findnz
 using Hungarian
 
 
@@ -9,42 +7,39 @@ Perform the Seeded Graph Matching algorithm to find an approximate matching
 between any two graphs with known matching seeds. m is the number of seeded
 vertices.
 """
-function sgm(graphA::AbstractMatrix{T}, graphB::AbstractMatrix{T}, m::Int; maxiter::Int=20, returniter::Bool=false, initmethod::Symbol=:barycenter) where T <: Real
+function sgm(A::Array{Int,2}, B::Array{Int,2}, m::Int; initmethod::Symbol=:barycenter, maxiter::Int=20, returniter::Bool=false)
 
     # 0. Checks
-    @assert size(graphA,1) == size(graphA,2) == size(graphB,1) == size(graphB,2)
+    @assert size(A,1) == size(A,2)
+    @assert size(B,1) == size(B,2)
+    @assert size(A,1) == size(B,1)
     @assert initmethod in [:barycenter, :random]
 
     # 0. Get size
-    N = size(graphA,1)
+    N = size(A,1)
     n = N - m
 
     # 0. Convert adjacency matricies
-    A = Float32.(graphA)
-    B = Float32.(graphB)
+    A = Float32.(A)
+    B = Float32.(B)
 
     # 0. Split A and B into seeded and non-seeded parts
 
-    A₁₁ = @view A[1:m, 1:m]
-    A₁₂ = @view A[1:m, m+1:end]
-    A₂₁ = @view A[m+1:end, 1:m]
-    A₂₂ = @view A[m+1:end, m+1:end]
+    A11 = A[1:m, 1:m]
+    A12 = A[1:m, m+1:end]
+    A21 = A[m+1:end, 1:m]
+    A22 = A[m+1:end, m+1:end]
 
-    B₁₁ = @view B[1:m, 1:m]
-    B₁₂ = @view B[1:m, m+1:end]
-    B₂₁ = @view B[m+1:end, 1:m]
-    B₂₂ = @view B[m+1:end, m+1:end]
+    B11 = B[1:m, 1:m]
+    B12 = B[1:m, m+1:end]
+    B21 = B[m+1:end, 1:m]
+    B22 = B[m+1:end, m+1:end]
 
     # 0. Precompute constant values
-    s1 = tr(gemm('T', 'N', A₁₁, B₁₁))
-    s2 = gemm('N', 'T', A₂₁, B₂₁)
-    s3 = gemm('T', 'N', A₁₂, B₁₂)
-    s23 = s2 + s3
-    ϵ::Float32 = 1e-3
-
-    # 0. Preallocate arrays
-    Q  = Array{Float32,2}(undef, n, n)
-    ∇f = Array{Float32,2}(undef, n, n)
+    s1 = tr(BLAS.gemm('T', 'N', A11, B11))
+    s2 = BLAS.gemm('N', 'T', A21, B21)
+    s3 = BLAS.gemm('T', 'N', A12, B12)
+    ϵ = 1e-3
 
     # 1. Initialize P
     P = ones(Float32, n, n) / n
@@ -58,41 +53,36 @@ function sgm(graphA::AbstractMatrix{T}, graphB::AbstractMatrix{T}, m::Int; maxit
         it += 1
 
         # 3. Compute the gradient
-        s4 = gemm('T', 'N', A₂₂, gemm('N', 'N', P, B₂₂))
-        broadcast!((a,b,c)->a+b+c, ∇f, s23, s4, gemm('N', 'N', A₂₂, gemm('N', 'T', P, B₂₂)))
+        s4 = BLAS.gemm('T', 'N', A22, BLAS.gemm('N', 'N', P, B22))
+        ∇f = s2 + s3 + s4 + BLAS.gemm('N', 'N', A22, BLAS.gemm('N', 'T', P, B22))
 
         # 4. Find best permutation via Hungarian algorithm
         mm = maximum(∇f) + ϵ
         matching = Hungarian.munkres(-∇f .+ mm)
-        fill!(Q, zero(Float32))
-        for (_i,_j,_v) in zip(findnz(matching)...)
-            if _v == Hungarian.STAR
-                Q[_i,_j] = one(Float32)
-            end
-        end
+        Q = Float32.(Matrix(matching .== Hungarian.STAR))
 
         # 5. Compute the (maybe) optimal step size
-        s5 = gemm('T', 'N', A₂₂, gemm('N', 'N', Q, B₂₂))
-        c = tr(gemm('N', 'T', s4, P))
-        d = tr(gemm('N', 'T', s4, Q)) + tr(gemm('N', 'T', s5, P))
-        e = tr(gemm('N', 'T', s5, Q))
-        u = tr(gemm('T', 'N', P, s2)) + tr(gemm('T', 'N', P, s3))
-        v = tr(gemm('T', 'N', Q, s2)) + tr(gemm('T', 'N', Q, s3))
+        s5 = BLAS.gemm('T', 'N', A22, BLAS.gemm('N', 'N', Q, B22))
+        c = tr(BLAS.gemm('N', 'T', s4, P))
+        d = tr(BLAS.gemm('N', 'T', s4, Q)) + tr(BLAS.gemm('N', 'T', s5, P))
+        e = tr(BLAS.gemm('N', 'T', s5, Q))
+        u = tr(BLAS.gemm('T', 'N', P, s2)) + tr(BLAS.gemm('T', 'N', P, s3))
+        v = tr(BLAS.gemm('T', 'N', Q, s2)) + tr(BLAS.gemm('T', 'N', Q, s3))
 
-        α̃ = zero(Float32)
+        α̃::Float32 = 0
         if (c - d + e != 0)
             α̃ = - (d - 2e + u - v) / (2 * (c - d + e))
         end
 
         # 6. Update P
 
-        f₀ = zero(Float32)
-        f₁ = c - e + u - v
-        fα = (c - d + e) * (α̃^2) + (d - 2e + u - v) * α̃
+        f0 = 0
+        f1 = c - e + u - v
+        falpha = (c - d + e) * (α̃^2) + (d - 2e + u - v) * α̃
 
-        if (ϵ < α̃ < 1-ϵ) && (f₀ < fα) && (f₁ < fα)
-            broadcast!((_p,_q) -> (α̃ * _p) + ((1-α̃) * _q), P, P, Q)
-        elseif f₁ < f₀
+        if ϵ < α̃ < 1-ϵ && falpha > f0 && falpha > f1
+            P = (α̃ * P) + ((1-α̃) * Q)
+        elseif f0 > f1
             P = Q
         else
             break
@@ -112,10 +102,11 @@ function sgm(graphA::AbstractMatrix{T}, graphB::AbstractMatrix{T}, m::Int; maxit
     matching = hcat(getindex.(matching,1), getindex.(matching,2))
     matching = sortslices(matching, dims=1)
 
-    # 9. Return P̂ and the associated matching
     if returniter
         return P̂, matching, it
     end
+
+    # 9. Return P̂ and the associated matching
     return P̂, matching
 
 end
